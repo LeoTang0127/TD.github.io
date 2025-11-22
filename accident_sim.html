@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <title>中華路/600巷車禍模擬 - 實景障礙物版 (Z=-2.0m)</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: #000;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    #info {
+      position: absolute;
+      left: 10px;
+      top: 10px;
+      z-index: 10;
+      color: #fff;
+      background: rgba(0,0,0,0.5);
+      padding: 8px 12px;
+      border-radius: 6px;
+      font-size: 13px;
+      max-width: 550px;
+    }
+    #sliderWrap {
+      position: absolute;
+      left: 10px;
+      bottom: 10px;
+      z-index: 10;
+      color: #fff;
+      background: rgba(0,0,0,0.6);
+      padding: 8px 12px;
+      border-radius: 6px;
+      font-size: 12px;
+    }
+    #timeSlider { width: 300px; }
+    #timeLabel { color: #ff9999; font-weight: bold; }
+    #errorMsg {
+      position: absolute;
+      left: 10px;
+      top: 80px;
+      z-index: 20;
+      color: #ff6666;
+      background: rgba(0,0,0,0.7);
+      padding: 6px 10px;
+      border-radius: 6px;
+      font-size: 12px;
+      max-width: 500px;
+    }
+  </style>
+</head>
+<body>
+<div id="info">
+  中華路 / 600 巷 車禍模擬 - **【極限瞬撞版 + 實景障礙物】**<br/>
+  **A車動態:** $\mathbf{1\text{s}}$ 內激進轉彎 (因子 $0.7$ )。<br/>
+  **B車速度:** **$\mathbf{140.0\text{km/h}}$** (每秒移動約 $\mathbf{38.9\text{m}}$)。<br/>
+  **視覺要素:** 已新增**電線桿**與**反射鏡**，模擬路口視線遮蔽情況。
+</div>
+<div id="sliderWrap">
+  模擬時間（T=-7秒 → 0秒）：<br/>
+  <input id="timeSlider" type="range" min="0" max="7000" value="0" />
+  <span id="timeLabel">T = -7.0 s</span>
+</div>
+<div id="errorMsg" style="display:none;"></div>
+
+<script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
+<script>
+if (typeof THREE === "undefined") {
+  const err = document.getElementById("errorMsg");
+  err.style.display = "block";
+  err.innerText =
+    "three.js 沒載入成功，無法顯示模擬。\n請確認目前有網路，且沒有封鎖 unpkg.com。";
+} else {
+  let scene, camera, renderer;
+  let carA, carB; 
+  let carAMesh; 
+  let clock = new THREE.Clock();
+  let simDuration = 7.0;   // 總時間 7.0s 
+  let simTime = 0;         
+  let slider = document.getElementById("timeSlider");
+  let label  = document.getElementById("timeLabel");
+
+  const PI_HALF = Math.PI / 2;
+  const PI = Math.PI;
+  const KMH_TO_UNITS = 0.2778; 
+
+  // A 車尺寸
+  const CAR_A_LENGTH = 4.0;
+  const CAR_A_HALF_LENGTH = CAR_A_LENGTH / 2;
+  const CAR_A_WIDTH = 1.8;
+  const CAR_A_HALF_WIDTH = CAR_A_WIDTH / 2; 
+
+  // B 車尺寸
+  const CAR_B_LENGTH = 2.0; 
+  const CAR_B_HALF_LENGTH = CAR_B_LENGTH / 2;
+  const CAR_B_WIDTH = 0.8; 
+
+  // --- T=0s 時的最終幾何 ---
+  const A_FINAL_ROT = PI - (10 * Math.PI / 180); // 170 度
+  const COLLISION_X = 0.5; 
+  const COLLISION_Z = -2.0; 
+  
+  const deltaX_Final = CAR_A_HALF_LENGTH * Math.sin(A_FINAL_ROT) - CAR_A_HALF_WIDTH * Math.cos(A_FINAL_ROT); 
+  const deltaZ_Final = CAR_A_HALF_LENGTH * Math.cos(A_FINAL_ROT) + CAR_A_HALF_WIDTH * Math.sin(A_FINAL_ROT); 
+  
+  const FINAL_CENTER_X = COLLISION_X - deltaX_Final; 
+  const FINAL_CENTER_Z = COLLISION_Z - deltaZ_Final; 
+  
+  // --- A 車運動參數 (T=-2s 停黃線 Z=-6.0) ---
+  const Z_NOSE_T5_CONSTRAINT = -6.0; 
+  const Z_CENTER_AT_STOP = Z_NOSE_T5_CONSTRAINT - CAR_A_HALF_LENGTH; // -8.0
+
+  const D_ACCEL_STOP = 30.0; // 30.0m 直行距離
+  const Z_CENTER_T0_VISUAL = Z_CENTER_AT_STOP - D_ACCEL_STOP; // -38.0
+
+  // B 車速度與路徑 *** 調整為 140.0 km/h ***
+  const V_B_KMH = 140.0;
+  const V_B_UNITS = V_B_KMH * KMH_TO_UNITS;
+  const D_B_TOTAL_7S = V_B_UNITS * simDuration; 
+
+  // B 車初始中心 X 位置 (t=0s)
+  const B_CENTER_X_FINAL = COLLISION_X + CAR_B_HALF_LENGTH; 
+  const B_START_X = B_CENTER_X_FINAL + D_B_TOTAL_7S; 
+
+  // A 車運動時間點 (t_sim)
+  const T_STOP_START = 5.0; // T=-2s 時開始停止 (5s 直行減速)
+  const T_TURN_START = 6.0; // T=-1s 時開始轉彎 (1s 停止)
+  const T_COLLISION = 7.0;  // T=0s 時碰撞 (1s 轉彎)
+
+  // A車轉彎位移速度係數 *** 激進因子 0.7 ***
+  const A_TURN_SPEED_FACTOR = 0.7; 
+
+  init();
+  animate();
+
+  function createWhiteCarModel() {
+      const carA_Group = new THREE.Group();
+
+      // 1. 車身 (Body): 白色
+      const carBodyGeo = new THREE.BoxGeometry(CAR_A_WIDTH, 1.0, CAR_A_LENGTH); 
+      const carBodyMat = new THREE.MeshPhongMaterial({ color: 0xffffff }); 
+      const carBodyMesh = new THREE.Mesh(carBodyGeo, carBodyMat);
+      carBodyMesh.position.y = 0.5; 
+      carA_Group.add(carBodyMesh);
+
+      // 2. 駕駛艙/車頂 (Cabin): 灰色/深色 
+      const carCabinGeo = new THREE.BoxGeometry(CAR_A_WIDTH * 0.8, 0.6, CAR_A_LENGTH * 0.5); 
+      const carCabinMat = new THREE.MeshPhongMaterial({ color: 0x444444 }); 
+      const carCabinMesh = new THREE.Mesh(carCabinGeo, carCabinMat);
+      carCabinMesh.position.y = 1.3; 
+      carA_Group.add(carCabinMesh);
+      
+      return carA_Group;
+  }
+
+  function createZLine(z, color) {
+      const roadLength = 120; 
+      const material = new THREE.LineBasicMaterial({ color: color, linewidth: 2 });
+      const points = [];
+      points.push(new THREE.Vector3(-roadLength / 2, 0.03, z));
+      points.push(new THREE.Vector3(roadLength / 2, 0.03, z));
+      const geometry = new THREE.BufferGeometry().setFromPoints(points);
+      return new THREE.Line(geometry, material);
+  }
+
+  function addMarkers() {
+      scene.add(createZLine(-6.0, 0xffa500)); // 黃線
+      scene.add(createZLine(0.0, 0xffffff)); // 中心線
+      scene.add(createZLine(-2.0, 0x00ff00)); // B 軌道線
+      scene.add(createZLine(6.0, 0xaaaaaa)); // 北緣
+      for (let z = -5.0; z <= 5.0; z += 1.0) {
+          if (z !== 0.0 && z !== -2.0) { 
+              scene.add(createZLine(z, 0x888888)); 
+          }
+      }
+  }
+
+  function addObstacles() {
+      // 1. A車左側障礙物 (電線桿) - 黃黑條紋
+      const poleGeometry = new THREE.CylinderGeometry(0.3, 0.3, 10, 8); 
+      const poleMaterial = new THREE.MeshPhongMaterial({ color: 0x333333 }); 
+      const pole = new THREE.Mesh(poleGeometry, poleMaterial);
+      pole.position.set(-1.0, 5.0, -7.0); 
+      scene.add(pole);
+
+      // 黃色條紋
+      const stripeMaterial = new THREE.MeshPhongMaterial({ color: 0xffff00 });
+      for (let i = 0; i < 5; i++) {
+          const stripeGeo = new THREE.CylinderGeometry(0.31, 0.31, 0.5, 8);
+          const stripe = new THREE.Mesh(stripeGeo, stripeMaterial);
+          stripe.position.set(-1.0, 1.0 + i * 1.5, -7.0);
+          scene.add(stripe);
+      }
+
+      // 2. A車右側障礙物 (反射鏡)
+      // 鏡子桿
+      const mirrorPoleGeo = new THREE.CylinderGeometry(0.1, 0.1, 8, 6);
+      const mirrorPoleMat = new THREE.MeshPhongMaterial({ color: 0x555555 });
+      const mirrorPole = new THREE.Mesh(mirrorPoleGeo, mirrorPoleMat);
+      mirrorPole.position.set(2.0, 4.0, 7.0); 
+      scene.add(mirrorPole);
+
+      // 凸面鏡 (半球體)
+      const mirrorGeo = new THREE.SphereGeometry(1.0, 32, 32, 0, Math.PI); 
+      const mirrorMat = new THREE.MeshPhongMaterial({ 
+          color: 0xcccccc, 
+          specular: 0xffffff, 
+          shininess: 100,
+          flatShading: false
+      });
+      const mirror = new THREE.Mesh(mirrorGeo, mirrorMat);
+      mirror.rotation.x = Math.PI / 2; // 面向路口
+      mirror.rotation.z = Math.PI / 4; 
+      mirror.position.set(2.0, 7.5, 7.0); 
+      scene.add(mirror);
+  }
+
+
+  function init() {
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x87ceeb);
+
+    const aspect = window.innerWidth / window.innerHeight;
+    camera = new THREE.PerspectiveCamera(50, aspect, 0.1, 500); 
+
+    camera.position.set(40, 35, 20); 
+    camera.lookAt(0, 0, 0); 
+
+    renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 0.7);
+    hemi.position.set(0, 50, 0);
+    scene.add(hemi);
+
+    const dir = new THREE.DirectionalLight(0xffffff, 0.6);
+    dir.position.set(30, 40, 10);
+    scene.add(dir);
+
+    // 地面、道路
+    const groundGeo = new THREE.PlaneGeometry(200, 200);
+    const groundMat = new THREE.MeshPhongMaterial({ color: 0x88a060 });
+    const ground = new THREE.Mesh(groundGeo, groundMat);
+    ground.rotation.x = -PI_HALF;
+    scene.add(ground);
+
+    const mainRoadGeo = new THREE.PlaneGeometry(120, 12); 
+    const mainRoadMat = new THREE.MeshPhongMaterial({ color: 0x444444 });
+    const mainRoad = new THREE.Mesh(mainRoadGeo, mainRoadMat);
+    mainRoad.rotation.x = -PI_HALF;
+    mainRoad.position.set(0, 0.01, 0);
+    scene.add(mainRoad);
+
+    const sideRoadGeo = new THREE.PlaneGeometry(30, 8);
+    const sideRoadMat = new THREE.MeshPhongMaterial({ color: 0x555555 });
+    const sideRoad = new THREE.Mesh(sideRoadGeo, sideRoadMat);
+    sideRoad.rotation.x = -PI_HALF;
+    sideRoad.rotation.z = Math.PI / 2;
+    sideRoad.position.set(0, 0.02, -14);
+    scene.add(sideRoad);
+    
+    addMarkers();
+    addObstacles(); // *** 新增實景障礙物 ***
+
+    // --- A 車（白色 3D 模型） ---
+    carA = new THREE.Group();
+    carA.position.set(0, 0.7, Z_CENTER_T0_VISUAL); 
+    carA.rotation.y = PI; 
+    scene.add(carA);
+    
+    // 使用複合模型取代單一盒子 (這裡我加入了白色車模型)
+    carAMesh = createWhiteCarModel();
+    carA.add(carAMesh);
+
+    // --- B 車：紅色盒子 ---
+    const bikeGeo = new THREE.BoxGeometry(CAR_B_WIDTH, 1.0, CAR_B_LENGTH); 
+    const carMatB = new THREE.MeshPhongMaterial({ color: 0xff3333 });
+    carB = new THREE.Mesh(bikeGeo, carMatB);
+    
+    carB.position.set(B_START_X, 0.5, COLLISION_Z); 
+    carB.rotation.y = -PI_HALF; 
+    scene.add(carB);
+
+    slider.addEventListener("input", () => {
+      simTime = slider.value / 1000;
+      updateSimulation(simTime);
+      const tWorld = -simDuration + simTime;
+      label.textContent = "T = " + tWorld.toFixed(1) + " s";
+    });
+
+    window.addEventListener("resize", onResize);
+  }
+
+  function updateSimulation(t) {
+    // --- B車運動 (右往左，恆定 140 km/h) ---
+    carB.position.x = B_START_X - V_B_UNITS * t; 
+    carB.position.z = COLLISION_Z; 
+    carB.rotation.y = -PI_HALF; 
+
+    // --- A車運動 (視覺驅動) ---
+    let rotation = PI;
+    let center_x = 0;
+    let mesh_offset_z = 0; 
+
+    if (t < T_STOP_START) {
+      // 階段 1: 直行減速 (t=0s 到 t=5s)
+      const k = t / T_STOP_START; 
+      center_x = 0;
+      center_z = Z_CENTER_T0_VISUAL + (Z_CENTER_AT_STOP - Z_CENTER_T0_VISUAL) * k;
+      rotation = PI; 
+    } else if (t >= T_STOP_START && t < T_TURN_START) {
+      // 階段 2: 停在黃線 (t=5s 到 t=6s) -> 1s 停止
+      center_x = 0;
+      center_z = Z_CENTER_AT_STOP;
+      rotation = PI;
+    } else {
+      // 階段 3: 右轉加速 (t=6s 到 t=7s) -> 1s 轉彎
+      const t_turn = t - T_TURN_START; 
+      const turn_duration = T_COLLISION - T_TURN_START; // 1.0s
+      const k_turn = t_turn / turn_duration; 
+
+      // 1. 旋轉：相對較慢 (因子 0.5)
+      const startRot = PI;
+      const rot_k = k_turn; 
+      rotation = startRot - (startRot - A_FINAL_ROT) * rot_k * 0.5; 
+
+      const START_CENTER_X_TURN = 0;
+      const START_CENTER_Z_TURN = Z_CENTER_AT_STOP; 
+      
+      const deltaX = FINAL_CENTER_X - START_CENTER_X_TURN; 
+      const deltaZ = FINAL_CENTER_Z - START_CENTER_Z_TURN; 
+
+      // 2. 位移：*** 激進因子 0.7 ***
+      const pos_k = k_turn * A_TURN_SPEED_FACTOR; 
+      
+      center_x = START_CENTER_X_TURN + deltaX * pos_k;
+      center_z = START_CENTER_Z_TURN + deltaZ * pos_k;
+      
+      // 3. 確定 Pivot 點 (前軸心)
+      const forwardX = -Math.sin(rotation);
+      const forwardZ = Math.cos(rotation);
+      
+      const x_pivot = center_x + CAR_A_HALF_LENGTH * forwardX;
+      const z_pivot = center_z + CAR_A_HALF_LENGTH * forwardZ;
+
+      carA.position.set(x_pivot, 0.7, z_pivot);
+      carA.rotation.y = rotation;
+      
+      // 調整 Mesh 位置使 Group 軸心在前軸心
+      mesh_offset_z = -CAR_A_HALF_LENGTH;
+    }
+
+    // 更新 A 車位置 (非轉彎階段)
+    if (t < T_TURN_START) { 
+        carA.position.set(center_x, 0.7, center_z);
+        carA.rotation.y = rotation;
+        mesh_offset_z = 0;
+    }
+    
+    // 調整 Mesh 的 Z 位置
+    carAMesh.position.z = mesh_offset_z; 
+    renderer.render(scene, camera);
+  }
+
+  function animate() {
+    requestAnimationFrame(animate);
+
+    const delta = clock.getDelta();
+    simTime += delta;
+    if (simTime > simDuration) simTime -= simDuration;
+
+    updateSimulation(simTime);
+
+    slider.value = simTime * 1000;
+    const tWorld = -simDuration + simTime;
+    label.textContent = "T = " + tWorld.toFixed(1) + " s";
+
+  }
+
+  function onResize() {
+    const aspect = window.innerWidth / window.innerHeight;
+    camera.aspect = aspect;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  }
+}
+</script>
+</body>
+</html>
